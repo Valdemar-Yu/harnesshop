@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from atif import Trajectory
 
 from harnesshop.adapters.codex import parse_codex_rollout
@@ -242,6 +243,212 @@ def test_event_only_agent_step_uses_applicable_turn_context(tmp_path: Path) -> N
     assert [(step.model_name, step.reasoning_effort) for step in trajectory.steps] == [
         ("model-a", "low")
     ]
+
+
+@pytest.mark.parametrize(
+    ("session_fields", "ordinal", "message"),
+    [
+        (
+            {
+                "history_mode": "paginated",
+                "history_base": {"thread_id": "parent", "end_ordinal_exclusive": 4},
+            },
+            0,
+            "paginated Codex lineage",
+        ),
+        (
+            {"history_base": {"thread_id": "parent", "end_ordinal_exclusive": 4}},
+            None,
+            "paginated Codex lineage",
+        ),
+        ({}, 0, "ordinal-bearing Codex rollouts"),
+        (
+            {"forked_from_ordinal_exclusive": 9},
+            None,
+            "ordinal-bounded Codex fork or subagent history",
+        ),
+        (
+            {"subagent_history_start_ordinal": 3},
+            None,
+            "ordinal-bounded Codex fork or subagent history",
+        ),
+        ({"history_mode": "future-mode"}, None, "unknown Codex history_mode"),
+        ({"history_mode": []}, None, "unknown Codex history_mode"),
+    ],
+)
+def test_new_codex_history_modes_fail_closed_until_lineage_is_supported(
+    tmp_path: Path,
+    session_fields: dict,
+    ordinal: int | None,
+    message: str,
+) -> None:
+    path = tmp_path / "paginated.jsonl"
+    meta = _record(
+        "session_meta",
+        {"id": "new-history", "cli_version": "0.150.1", **session_fields},
+        0,
+    )
+    if ordinal is not None:
+        meta["ordinal"] = ordinal
+    path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        parse_codex_rollout(path)
+
+
+def test_self_contained_paginated_rollout_uses_contiguous_source_ordinals(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "self-contained-paginated.jsonl"
+    records = [
+        _record(
+            "session_meta",
+            {"id": "paginated", "cli_version": "0.149.0", "history_mode": "paginated"},
+            0,
+        ),
+        _record("turn_context", {"model": "model-p", "effort": "medium"}, 1),
+        _response_message("user", "hello", 2),
+        _record(
+            "event_msg",
+            {"type": "item_completed", "item": {"type": "UserMessage"}},
+            3,
+        ),
+        _response_message("assistant", "hi", 4),
+    ]
+    for ordinal, record in enumerate(records):
+        record["ordinal"] = ordinal
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    trajectory = parse_codex_rollout(path)
+
+    assert [step.message for step in trajectory.steps] == ["hello", "hi"]
+    assert [
+        step.extra["harnesshop"]["codex"]["source_ordinal"]
+        for step in trajectory.steps
+    ] == [2, 4]
+    assert trajectory.steps[1].model_name == "model-p"
+    assert trajectory.extra["harnesshop"]["source"]["history_mode"] == "paginated"
+
+
+def test_paginated_rollout_with_noncontiguous_ordinals_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "gapped-paginated.jsonl"
+    records = [
+        _record(
+            "session_meta",
+            {"id": "gapped", "cli_version": "0.149.0", "history_mode": "paginated"},
+            0,
+        ),
+        _response_message("user", "missing ordinal one", 1),
+    ]
+    records[0]["ordinal"] = 0
+    records[1]["ordinal"] = 2
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    with pytest.raises(ValueError, match="contiguous ordinals starting at zero"):
+        parse_codex_rollout(path)
+
+
+def test_paginated_legacy_compaction_summary_keeps_checkpoint_ordinal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paginated-compaction.jsonl"
+    records = [
+        _record(
+            "session_meta",
+            {"id": "compact", "cli_version": "0.149.0", "history_mode": "paginated"},
+            0,
+        ),
+        _response_message("user", "before", 1),
+        _record("compacted", {"message": "summary"}, 2),
+        _response_message("user", "after", 3),
+        _response_message("assistant", "answer", 4),
+    ]
+    for ordinal, record in enumerate(records):
+        record["ordinal"] = ordinal
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    trajectory = parse_codex_rollout(path)
+
+    assert [step.message for step in trajectory.steps] == [
+        "before",
+        "summary",
+        "after",
+        "answer",
+    ]
+    assert [
+        step.extra["harnesshop"]["codex"]["source_ordinal"]
+        for step in trajectory.steps
+    ] == [1, 2, 3, 4]
+
+
+def test_rich_paginated_item_completed_is_counted_as_unsupported_loss(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rich-item.jsonl"
+    records = [
+        _record(
+            "session_meta",
+            {"id": "rich", "cli_version": "0.149.0", "history_mode": "paginated"},
+            0,
+        ),
+        _record(
+            "event_msg",
+            {
+                "type": "item_completed",
+                "item": {"type": "CommandExecution", "duration_ms": 123},
+            },
+            1,
+        ),
+    ]
+    for ordinal, record in enumerate(records):
+        record["ordinal"] = ordinal
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    trajectory = parse_codex_rollout(path)
+
+    fidelity = trajectory.extra["harnesshop"]["fidelity"]
+    assert fidelity["unsupported_source_items"] == 1
+    assert fidelity["duplicate_events_skipped"] == 0
+
+
+def test_rollout_without_session_meta_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "missing-meta.jsonl"
+    path.write_text(json.dumps(_response_message("user", "orphan", 1)) + "\n")
+
+    with pytest.raises(ValueError, match="no usable session_meta"):
+        parse_codex_rollout(path)
+
+
+def test_compressed_rollout_fails_with_explicit_compatibility_error(tmp_path: Path) -> None:
+    path = tmp_path / "rollout-cold.jsonl.zst"
+    path.write_bytes(b"not parsed as UTF-8")
+
+    with pytest.raises(ValueError, match="Zstandard-compressed Codex rollouts"):
+        parse_codex_rollout(path)
+
+
+def test_routed_multi_agent_message_is_not_promoted_to_main_assistant(tmp_path: Path) -> None:
+    path = tmp_path / "multi-agent.jsonl"
+    records = [
+        _record("session_meta", {"id": "multi-agent", "cli_version": "0.150.1"}, 0),
+        _record(
+            "response_item",
+            {
+                "type": "agent_message",
+                "author": "agent-a",
+                "recipient": "agent-b",
+                "content": "internal handoff",
+            },
+            1,
+        ),
+        _response_message("assistant", "user-visible answer", 2),
+    ]
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    trajectory = parse_codex_rollout(path)
+
+    assert [step.message for step in trajectory.steps] == ["user-visible answer"]
+    assert trajectory.extra["harnesshop"]["fidelity"]["unsupported_source_items"] == 1
 
 
 def test_first_session_meta_owns_thread_identity_when_prefix_contains_parent_meta(

@@ -10,9 +10,18 @@ from pathlib import Path
 import pytest
 from atif import Trajectory
 
+from harnesshop import __version__
 from harnesshop.cli import main
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codex_rollout.jsonl"
+
+
+def test_cli_version_matches_package(capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["--version"])
+
+    assert raised.value.code == 0
+    assert capsys.readouterr().out.strip() == f"harnesshop {__version__}"
 
 
 def test_cli_converts_codex_rollout_to_valid_atif(tmp_path: Path) -> None:
@@ -315,6 +324,70 @@ def test_current_rollout_index_uses_uri_safe_sqlite_path(tmp_path: Path) -> None
 
     assert code == 0
     assert output.exists()
+
+
+def test_directory_conversion_does_not_silently_ignore_compressed_rollouts(
+    tmp_path: Path, capsys
+) -> None:
+    codex_home = tmp_path / ".codex"
+    sessions_dir = codex_home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "rollout-cold.jsonl.zst").write_bytes(b"compressed")
+    output = tmp_path / "out.json"
+
+    code = main(
+        [
+            "convert",
+            "--from",
+            "codex",
+            "--to",
+            "atif",
+            str(codex_home),
+            "--output",
+            str(output),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "Zstandard-compressed Codex rollouts" in captured.err
+    assert not output.exists()
+
+
+def test_indexed_logical_jsonl_path_detects_compressed_cold_rollout(
+    tmp_path: Path, capsys
+) -> None:
+    codex_home = tmp_path / ".codex"
+    sessions_dir = codex_home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    compressed = sessions_dir / "rollout-cold.jsonl.zst"
+    compressed.write_bytes(b"compressed")
+    logical = Path(str(compressed).removesuffix(".zst"))
+    db = sqlite3.connect(codex_home / "state_1.sqlite")
+    db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+    db.execute("INSERT INTO threads VALUES (?, ?)", ("cold", str(logical)))
+    db.commit()
+    db.close()
+    output = tmp_path / "out.json"
+
+    code = main(
+        [
+            "convert",
+            "--from",
+            "codex",
+            "--to",
+            "atif",
+            str(codex_home),
+            "--output",
+            str(output),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "Zstandard-compressed Codex rollouts" in captured.err
+    assert "does not match any rollout files" not in captured.err
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(

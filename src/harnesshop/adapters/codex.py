@@ -41,6 +41,11 @@ def parse_codex_rollout(
     records are used only as a fallback.
     """
     source_path = Path(path)
+    if source_path.name.endswith(".jsonl.zst"):
+        raise ValueError(
+            "Zstandard-compressed Codex rollouts are not supported yet; "
+            "decompress this file or select an uncompressed current rollout"
+        )
     records, malformed = _load_records(source_path)
     fidelity = FidelityReport(unsupported_source_records=malformed)
     if history_mode not in {"active", "audit"}:
@@ -58,6 +63,42 @@ def parse_codex_rollout(
             context = dict(payload)
             context["_harnesshop_timestamp"] = _timestamp(record)
             turn_contexts.append(context)
+
+    if not session_meta:
+        raise ValueError(f"Codex rollout {source_path} has no usable session_meta record")
+    source_history_mode = session_meta.get("history_mode", "legacy")
+    if not isinstance(source_history_mode, str) or source_history_mode not in {
+        "legacy",
+        "paginated",
+    }:
+        raise ValueError(f"unknown Codex history_mode: {source_history_mode!r}")
+    if session_meta.get("history_base") is not None:
+        raise ValueError(
+            "paginated Codex lineage in session_meta.history_base is not supported yet"
+        )
+    if any(
+        session_meta.get(field_name) is not None
+        for field_name in (
+            "forked_from_ordinal_exclusive",
+            "subagent_history_start_ordinal",
+        )
+    ):
+        raise ValueError(
+            "ordinal-bounded Codex fork or subagent history is not supported yet"
+        )
+    ordinals = [record.get("ordinal") for record in records]
+    if source_history_mode == "paginated":
+        if any(type(ordinal) is not int for ordinal in ordinals) or ordinals != list(
+            range(len(records))
+        ):
+            raise ValueError(
+                "self-contained paginated Codex rollouts require contiguous ordinals "
+                "starting at zero"
+            )
+    elif any(ordinal is not None for ordinal in ordinals):
+        raise ValueError(
+            "ordinal-bearing Codex rollouts require paginated history reconstruction"
+        )
 
     active_records = _materialize_response_records(records, fidelity, history_mode)
     response_records = [
@@ -104,7 +145,7 @@ def parse_codex_rollout(
                     "timestamp": timestamp,
                     "source": source,
                     "message": message,
-                    "extra": _step_extra(payload),
+                    "extra": _step_extra(payload, record),
                 }
                 if source == "agent":
                     reasoning = "\n".join(pending_reasoning).strip()
@@ -159,7 +200,7 @@ def parse_codex_rollout(
                             extra={"codex_item_type": item_type},
                         )
                     ],
-                    extra=_step_extra(payload),
+                    extra=_step_extra(payload, record),
                 )
                 steps.append(step)
                 call_steps[call_id] = step
@@ -186,17 +227,10 @@ def parse_codex_rollout(
                 continue
 
             if item_type == "agent_message":
-                message = _message_content(payload.get("content"), fidelity)
-                steps.append(
-                    Step(
-                        step_id=len(steps) + 1,
-                        timestamp=timestamp,
-                        source="agent",
-                        message=message,
-                        extra=_step_extra(payload),
-                    )
-                )
-                fidelity.source_records_preserved += 1
+                # Current Codex uses this item for routed multi-agent traffic,
+                # not a user-visible assistant answer. ATIF v1.7 has no stream
+                # graph to represent it without flattening agent boundaries.
+                fidelity.unsupported_source_items += 1
                 continue
 
             fidelity.unsupported_source_items += 1
@@ -215,7 +249,7 @@ def parse_codex_rollout(
                     "timestamp": timestamp,
                     "source": source,
                     "message": message,
-                    "extra": {"harnesshop": {"codex_event_type": event_type}},
+                    "extra": _event_step_extra(event_type, record),
                 }
                 if source == "agent":
                     model, effort = _model_for_timestamp(turn_contexts, timestamp)
@@ -274,7 +308,7 @@ def parse_codex_rollout(
                                 )
                             ]
                         ),
-                        extra={"harnesshop": {"codex_event_type": event_type}},
+                        extra=_event_step_extra(event_type, record),
                     )
                     steps.append(step)
                     call_steps[call_id] = step
@@ -282,6 +316,20 @@ def parse_codex_rollout(
                     fidelity.tool_calls_preserved += 1
                     fidelity.observation_results_preserved += 1
                 fidelity.source_records_preserved += 1
+                continue
+            if event_type == "item_completed":
+                item = payload.get("item")
+                item_type = item.get("type") if isinstance(item, dict) else None
+                if item_type in {
+                    "AgentMessage",
+                    "ContextCompaction",
+                    "FunctionCallOutput",
+                    "Reasoning",
+                    "UserMessage",
+                }:
+                    fidelity.duplicate_events_skipped += 1
+                else:
+                    fidelity.unsupported_source_items += 1
                 continue
             if event_type in {
                 "task_started",
@@ -291,7 +339,6 @@ def parse_codex_rollout(
                 "thread_settings_applied",
                 "thread_name_updated",
                 "agent_reasoning",
-                "item_completed",
                 "mcp_tool_call_end",
                 "patch_apply_end",
                 "image_generation_end",
@@ -300,7 +347,6 @@ def parse_codex_rollout(
             }:
                 if event_type in {
                     "agent_reasoning",
-                    "item_completed",
                     "mcp_tool_call_end",
                     "patch_apply_end",
                     "image_generation_end",
@@ -320,7 +366,16 @@ def parse_codex_rollout(
             continue
         fidelity.unsupported_source_records += 1
 
-    steps.sort(key=lambda step: (step.timestamp is None, step.timestamp or "", step.step_id))
+    if source_history_mode == "paginated":
+        steps.sort(
+            key=lambda step: (
+                _source_ordinal(step) is None,
+                _source_ordinal(step),
+                step.step_id,
+            )
+        )
+    else:
+        steps.sort(key=lambda step: (step.timestamp is None, step.timestamp or "", step.step_id))
     for index, step in enumerate(steps, start=1):
         step.step_id = index
 
@@ -409,6 +464,7 @@ def _materialize_response_records(
                     active.append(
                         {
                             "timestamp": record.get("timestamp"),
+                            "ordinal": record.get("ordinal"),
                             "type": "response_item",
                             "payload": item,
                         }
@@ -434,6 +490,7 @@ def _materialize_response_records(
                 active.append(
                     {
                         "timestamp": record.get("timestamp"),
+                        "ordinal": record.get("ordinal"),
                         "type": "response_item",
                         "payload": {
                             "type": "message",
@@ -699,15 +756,40 @@ def _latest_model(contexts: list[dict[str, Any]]) -> str | None:
     return model
 
 
-def _step_extra(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _step_extra(
+    payload: dict[str, Any], record: dict[str, Any]
+) -> dict[str, Any] | None:
     values = {
         key: payload.get(key)
         for key in ("id", "phase", "status", "author", "recipient")
         if payload.get(key) is not None
     }
+    if type(record.get("ordinal")) is int:
+        values["source_ordinal"] = record["ordinal"]
     if payload.get("encrypted_content"):
         values["has_encrypted_content"] = True
     return {"harnesshop": {"codex": values}} if values else None
+
+
+def _event_step_extra(event_type: str, record: dict[str, Any]) -> dict[str, Any]:
+    values: dict[str, Any] = {"event_type": event_type}
+    if type(record.get("ordinal")) is int:
+        values["source_ordinal"] = record["ordinal"]
+    return {"harnesshop": {"codex": values}}
+
+
+def _source_ordinal(step: Step) -> int | None:
+    extra = step.extra
+    if not isinstance(extra, dict):
+        return None
+    harnesshop = extra.get("harnesshop")
+    if not isinstance(harnesshop, dict):
+        return None
+    codex = harnesshop.get("codex")
+    if not isinstance(codex, dict):
+        return None
+    ordinal = codex.get("source_ordinal")
+    return ordinal if type(ordinal) is int else None
 
 
 def _extension(

@@ -34,13 +34,21 @@ ATIF is an existing public specification maintained by the Harbor project; Harne
 
 | Capability | Status | Notes |
 | --- | --- | --- |
-| Codex rollout JSONL → ATIF v1.7 | Supported | Messages, images, reasoning summaries, tool calls/results, timestamps, model, cwd, Git metadata |
-| Codex active-history reconstruction | Supported | Applies `replacement_history` compactions and `thread_rolled_back` events |
+| Codex legacy rollout JSONL → ATIF v1.7 | Supported | Verified end to end with Codex 0.142.4; common newer legacy records use explicit loss accounting |
+| Codex legacy active-history reconstruction | Supported | Applies `replacement_history` compactions and `thread_rolled_back` events |
 | Codex audit export | Supported | Keeps every durable response item from every selected rollout |
 | Codex current-rollout selection | Supported | Reads `state_*.sqlite` read-only and honors `threads.rollout_path` |
+| Codex self-contained paginated rollout | Supported | Requires complete contiguous ordinals from zero and preserves source ordering |
+| Codex paginated `history_base` / bounded lineage | Fail-closed | Rejected until recursive lineage reconstruction is implemented |
+| Zstandard-compressed `*.jsonl.zst` rollout | Fail-closed | Detected rather than silently omitted; decompression support is on the roadmap |
 | ATIF → Hermes JSON | Supported | Dashboard-compatible `{ "sessions": [...] }` payload |
 | Codex → live Hermes import | Supported | Uses the target Hermes installation's own Python and `SessionDB` |
 | Claude Code / OpenCode / Gemini / Aider adapters | Roadmap | Contributions welcome |
+
+See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the versioned support
+boundary. Codex rollout JSONL has no schema-version field and evolves between
+CLI releases, so HarnessHop distinguishes self-contained paginated files from
+lineage segments that would be incomplete on their own.
 
 ## Install
 
@@ -154,6 +162,7 @@ An explicit path is authoritative: HarnessHop fails instead of falling back to a
 - Hermes limits one imported session to 5 MiB. ATIF keeps the complete representable content, while the Hermes target truncates oversized message bodies head-and-tail. Every truncation contains a visible marker and `display_metadata.harnesshop` loss metadata.
 - Encrypted Codex content cannot be decrypted by HarnessHop. Its presence is counted in `extra.harnesshop.fidelity` rather than misrepresented as plaintext.
 - Unsupported records are counted; they are not silently claimed as preserved.
+- Unsupported paginated lineage, invalid ordinal sequences, and compressed rollouts stop conversion before any output or Hermes write.
 
 See [docs/FORMAT.md](docs/FORMAT.md) for the exact mapping and loss-accounting fields.
 
@@ -184,11 +193,12 @@ All committed fixtures are synthetic. New behavior should be developed test-firs
 
 ## Roadmap
 
-1. OpenCode import/export adapter, using its first-party round-trip schema.
-2. Claude Code JSONL reader with branch/sidechain reconstruction.
-3. Gemini CLI recording adapter after a field-level compatibility audit.
-4. Aider Markdown reader, explicitly marked low fidelity.
-5. Additional native writers only where the target exposes a supported import boundary.
+1. Codex paginated lineage reconstruction: ordinals, `history_base`, fork/revert bounds, subagent inherited-history cutoff, and `*.jsonl.zst`.
+2. OpenCode import/export adapter, using its first-party round-trip schema.
+3. Claude Code JSONL reader with branch/sidechain reconstruction.
+4. Gemini CLI recording adapter after a field-level compatibility audit.
+5. Aider Markdown reader, explicitly marked low fidelity.
+6. Additional native writers only where the target exposes a supported import boundary.
 
 ## License
 

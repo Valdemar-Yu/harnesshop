@@ -13,6 +13,7 @@ from pathlib import Path
 
 from atif import Trajectory
 
+from harnesshop import __version__
 from harnesshop.adapters.codex import parse_codex_rollout
 from harnesshop.adapters.hermes import to_hermes_session
 
@@ -37,7 +38,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="harnesshop",
         description="Move coding-agent sessions through ATIF without executing historical tools.",
     )
-    parser.add_argument("--version", action="version", version="harnesshop 0.1.0")
+    parser.add_argument("--version", action="version", version=f"harnesshop {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     convert = subparsers.add_parser(
@@ -177,7 +178,12 @@ def _rollout_paths(input_path: Path, *, history_mode: str) -> list[Path]:
     if path.is_file():
         return [path]
     if path.is_dir():
-        candidates = sorted(path.rglob("rollout-*.jsonl"))
+        candidates = sorted(
+            [
+                *path.rglob("rollout-*.jsonl"),
+                *path.rglob("rollout-*.jsonl.zst"),
+            ]
+        )
         if history_mode == "audit":
             return candidates
         indexed = _indexed_current_rollouts(path, candidates)
@@ -199,7 +205,12 @@ def _indexed_current_rollouts(
     if not state_dbs:
         return None
     state_db = max(state_dbs, key=_state_db_version)
-    candidate_map = {path.resolve(): path for path in candidates}
+    candidate_map: dict[Path, Path] = {}
+    for candidate in candidates:
+        candidate_map[candidate.resolve()] = candidate
+        if candidate.name.endswith(".jsonl.zst"):
+            logical_path = Path(str(candidate).removesuffix(".zst")).resolve()
+            candidate_map.setdefault(logical_path, candidate)
     try:
         connection = sqlite3.connect(state_db.resolve().as_uri() + "?mode=ro", uri=True)
         rows = connection.execute("SELECT rollout_path FROM threads").fetchall()
@@ -259,6 +270,8 @@ def _reject_duplicate_thread_rollouts(paths: list[Path]) -> None:
 
 
 def _rollout_session_id(path: Path) -> str | None:
+    if path.name.endswith(".jsonl.zst"):
+        return None
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
             try:

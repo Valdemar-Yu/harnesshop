@@ -2,6 +2,11 @@
 
 HarnessHop uses ATIF v1.7 as its portable layer and owns only the `extra.harnesshop` extension namespace.
 
+The parser supports legacy rollouts and self-contained paginated rollouts with
+complete contiguous ordinals starting at zero. It rejects external/bounded
+paginated lineage and compressed cold rollouts rather than exporting a partial
+trajectory as complete. See [COMPATIBILITY.md](COMPATIBILITY.md).
+
 ## Root extension
 
 ```json
@@ -52,6 +57,16 @@ HarnessHop uses ATIF v1.7 as its portable layer and owns only the `extra.harness
 | first `session_meta` | Root agent, workspace, Git, and source metadata |
 
 Codex UI/projection events that duplicate durable response items are counted in `duplicate_events_skipped`.
+Current `response_item.agent_message` records are routed multi-agent traffic,
+not ordinary assistant replies. They remain explicitly unsupported until ATIF
+stream/subagent graph projection is defined, so they are never promoted into
+the main Hermes conversation.
+
+Simple paginated `item_completed` projections for messages, reasoning,
+function outputs, and compaction are counted as duplicates of durable history.
+Rich UI TurnItems such as command execution, MCP calls, file changes, and
+extensions are counted in `unsupported_source_items` until their additional
+presentation metadata has an explicit mapping.
 
 ## Active history
 
@@ -64,6 +79,16 @@ Active mode mirrors Codex's forward model-history semantics:
 5. The first session meta owns the current thread identity; later metas can belong to copied fork/prefix history.
 
 When a Codex home is supplied, `state_*.sqlite` is opened read-only and `threads.rollout_path` selects the current file for each thread.
+
+Self-contained `history_mode="paginated"` files must contain every ordinal
+exactly once from zero through the final record. HarnessHop retains the source
+ordinal in step metadata and orders projected steps by it.
+
+`history_base`, ordinal-bounded fork/subagent metadata, missing or noncontiguous
+paginated ordinals, ordinal-bearing legacy files, unknown history modes,
+missing `session_meta`, and `*.jsonl.zst` currently raise a compatibility error
+before conversion. External/bounded lineage requires recursive reconstruction
+and cannot be handled honestly by skipping fields.
 
 ## Audit history
 
